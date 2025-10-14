@@ -39,7 +39,7 @@ import shutil
 import venv
 import zipfile
 from pathlib import Path
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import psutil
 import signal
 import requests
@@ -97,6 +97,59 @@ app.config['JSON_SORT_KEYS'] = False
 # API Configuration
 API_PORT = int(os.environ.get('HEXSTRIKE_PORT', 8888))
 API_HOST = os.environ.get('HEXSTRIKE_HOST', '127.0.0.1')
+
+# ============================================================================
+# SSE/HTTP TRANSPORT LAYER (v6.1 ENHANCEMENT)
+# ============================================================================
+
+class SessionManager:
+    """Minimal session management for SSE/HTTP transport"""
+
+    def __init__(self):
+        self.sessions = {}  # session_id -> Session dict
+        self.queues = {}    # session_id -> Queue for SSE events
+        self.lock = threading.Lock()
+
+    def create_session(self, api_key: str = "default") -> str:
+        """Create a new session and return session ID"""
+        session_id = hashlib.sha256(f"{api_key}{time.time()}".encode()).hexdigest()[:16]
+        with self.lock:
+            self.sessions[session_id] = {
+                "id": session_id,
+                "api_key": api_key,
+                "created_at": time.time(),
+                "last_activity": time.time()
+            }
+            self.queues[session_id] = queue.Queue()
+        logger.info(f"Created session: {session_id}")
+        return session_id
+
+    def get_queue(self, session_id: str) -> Optional[queue.Queue]:
+        """Get the SSE event queue for a session"""
+        return self.queues.get(session_id)
+
+    def cleanup_session(self, session_id: str):
+        """Clean up session resources"""
+        with self.lock:
+            self.sessions.pop(session_id, None)
+            q = self.queues.pop(session_id, None)
+            if q:
+                q.put(None)  # Signal SSE to close
+        logger.info(f"Cleaned up session: {session_id}")
+
+    def send_event(self, session_id: str, event_data: Dict[str, Any]):
+        """Send an event to a session's SSE stream"""
+        q = self.get_queue(session_id)
+        if q:
+            q.put(event_data)
+
+    def update_activity(self, session_id: str):
+        """Update last activity timestamp"""
+        if session_id in self.sessions:
+            self.sessions[session_id]["last_activity"] = time.time()
+
+# Global session manager
+session_manager = SessionManager()
 
 # ============================================================================
 # MODERN VISUAL ENGINE (v2.0 ENHANCEMENT)
@@ -9134,11 +9187,82 @@ def health_check():
         "uptime": time.time() - telemetry.stats["start_time"]
     })
 
+
+# ============================================================================
+# SSE/HTTP TRANSPORT ENDPOINTS (v6.1 ENHANCEMENT)
+# ============================================================================
+
+@app.route("/api/mcp/session", methods=["POST"])
+def create_mcp_session():
+    """Create a new MCP session for SSE/HTTP transport"""
+    try:
+        data = request.get_json() or {}
+        api_key = data.get("api_key", "default")
+
+        session_id = session_manager.create_session(api_key)
+
+        return jsonify({
+            "success": True,
+            "session_id": session_id,
+            "message": "Session created successfully"
+        })
+    except Exception as e:
+        logger.error(f"Failed to create session: {str(e)}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/mcp/sse")
+def mcp_sse_endpoint():
+    """Server-Sent Events endpoint for MCP protocol streaming"""
+    session_id = request.args.get('session_id')
+
+    if not session_id or session_id not in session_manager.sessions:
+        return jsonify({"error": "Invalid or missing session_id"}), 400
+
+    def event_stream():
+        """Generate SSE events for the session"""
+        q = session_manager.get_queue(session_id)
+        if not q:
+            return
+
+        try:
+            # Send initial connection event
+            yield f"data: {json.dumps({'type': 'connected', 'session_id': session_id})}\n\n"
+
+            while True:
+                # Get next event from queue (blocks until available)
+                message = q.get(timeout=30)
+
+                # None is sentinel value for disconnect
+                if message is None:
+                    break
+
+                # Send the event
+                yield f"data: {json.dumps(message)}\n\n"
+
+                session_manager.update_activity(session_id)
+
+        except queue.Empty:
+            # Heartbeat - send keepalive
+            yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        except Exception as e:
+            logger.error(f"SSE stream error: {str(e)}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            session_manager.cleanup_session(session_id)
+
+    response = Response(event_stream(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
+
+
 @app.route("/api/command", methods=["POST"])
 def generic_command():
-    """Execute any command provided in the request with enhanced logging"""
+    """Execute any command provided in the request with enhanced logging and optional SSE streaming"""
     try:
         params = request.json
+        session_id = params.get("session_id")  # Optional session ID for SSE streaming
         command = params.get("command", "")
         use_cache = params.get("use_cache", True)
 
@@ -9148,7 +9272,25 @@ def generic_command():
                 "error": "Command parameter is required"
             }), 400
 
+        # Send start event via SSE if session is provided
+        if session_id:
+            session_manager.send_event(session_id, {
+                "type": "command_started",
+                "command": command,
+                "timestamp": time.time()
+            })
+
         result = execute_command(command, use_cache=use_cache)
+
+        # Send completion event via SSE if session is provided
+        if session_id:
+            session_manager.send_event(session_id, {
+                "type": "command_completed",
+                "command": command,
+                "success": result.get("success", False),
+                "timestamp": time.time()
+            })
+
         return jsonify(result)
     except Exception as e:
         logger.error(f"💥 Error in command endpoint: {str(e)}")

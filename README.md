@@ -198,6 +198,80 @@ python3 hexstrike_server.py --debug
 python3 hexstrike_server.py --port 8888
 ```
 
+### SSE/HTTP Transport (v6.1 NEW!)
+
+HexStrike AI v6.1 introduces native SSE/HTTP transport for MCP protocol communication, enabling remote access and real-time streaming:
+
+**🚀 Quick Start:**
+
+```bash
+# Terminal 1: Start the HexStrike API server
+python3 hexstrike_server.py
+
+# Terminal 2: Start MCP server with SSE transport (AI agents connect here)
+python3 hexstrike_mcp.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8000
+
+# Terminal 3 (Optional): Test MCP SSE transport
+python3 test_mcp_sse_transport.py
+```
+
+**📡 Transport Options:**
+
+| Transport | Description | Use Case |
+|-----------|-------------|----------|
+| `stdio` (default) | Standard input/output | Local AI agents (Claude Desktop, Cursor) |
+| `sse` | Server-Sent Events over HTTP | Remote AI agents, real-time streaming |
+| `streamable-http` | HTTP with streaming responses | Web-based AI clients, API integrations |
+
+**🔧 Configuration Examples:**
+
+```bash
+# Local development (default stdio)
+python3 hexstrike_mcp.py
+
+# Remote access with SSE (AI agents connect via HTTP)
+python3 hexstrike_mcp.py --transport sse --mcp-host 0.0.0.0 --mcp-port 8000
+
+# Custom configuration with all options
+python3 hexstrike_mcp.py \
+  --transport sse \
+  --mcp-host 127.0.0.1 \
+  --mcp-port 8000 \
+  --server http://localhost:8888 \
+  --timeout 300 \
+  --debug
+```
+
+**🌐 Architecture:**
+
+```
+AI Agent (Claude) <--[SSE/HTTP]--> hexstrike_mcp.py <--[HTTP REST + SSE]--> hexstrike_server.py
+                     MCP Protocol                      Internal Communication
+```
+
+**✅ SSE/HTTP Transport Features:**
+- Real-time MCP protocol streaming over HTTP
+- Remote AI agent connectivity (no local installation required)
+- Multi-agent session support with isolated contexts
+- Native FastMCP SSE/HTTP transport integration
+- Automatic session management and cleanup
+- 100% backward compatible with stdio transport
+
+**🧪 Test SSE Transport:**
+```bash
+# Terminal 1: Start HexStrike API server
+python3 hexstrike_server.py
+
+# Terminal 2: Start MCP server with SSE transport
+python3 hexstrike_mcp.py --transport sse --mcp-host 127.0.0.1 --mcp-port 8000
+
+# Terminal 3: Test MCP SSE communication
+python3 test_mcp_sse_transport.py
+
+# Terminal 4 (Optional): Test internal hexstrike_server SSE
+python3 test_sse_transport.py
+```
+
 ### Verify Installation
 
 ```bash
@@ -216,6 +290,8 @@ curl -X POST http://localhost:8888/api/intelligence/analyze-target \
 
 ### Claude Desktop Integration or Cursor
 
+**📋 Local stdio Transport (Default):**
+
 Edit `~/.config/Claude/claude_desktop_config.json`:
 ```json
 {
@@ -227,13 +303,40 @@ Edit `~/.config/Claude/claude_desktop_config.json`:
         "--server",
         "http://localhost:8888"
       ],
-      "description": "HexStrike AI v6.0 - Advanced Cybersecurity Automation Platform",
+      "description": "HexStrike AI v6.1 - Advanced Cybersecurity Automation Platform",
       "timeout": 300,
       "disabled": false
     }
   }
 }
 ```
+
+**🌐 Remote SSE/HTTP Transport (v6.1 NEW!):**
+
+For remote access, first start the HexStrike MCP server with SSE transport:
+
+```bash
+# On the remote server (or localhost):
+python3 hexstrike_server.py  # Start API server
+python3 hexstrike_mcp.py --transport sse --mcp-host 0.0.0.0 --mcp-port 8000
+```
+
+Then configure Claude Desktop to connect via HTTP:
+```json
+{
+  "mcpServers": {
+    "hexstrike-ai-remote": {
+      "url": "http://your-server-ip:8000/sse",
+      "transport": "sse",
+      "description": "HexStrike AI v6.1 - Remote SSE Transport",
+      "timeout": 300,
+      "disabled": false
+    }
+  }
+}
+```
+
+Note: Some MCP clients may not yet support SSE/HTTP transport configuration. Check your client's documentation for SSE/HTTP support. If unsure, use the default stdio transport.
 
 ### VS Code Copilot Integration
 

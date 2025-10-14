@@ -21,6 +21,7 @@ import sys
 import os
 import argparse
 import logging
+import json
 from typing import Dict, Any, Optional
 import requests
 import time
@@ -144,6 +145,60 @@ DEFAULT_HEXSTRIKE_SERVER = "http://127.0.0.1:8888"  # Default HexStrike server U
 DEFAULT_REQUEST_TIMEOUT = 300  # 5 minutes default timeout for API requests
 MAX_RETRIES = 3  # Maximum number of retries for connection attempts
 
+class SSETransport:
+    """Minimal SSE transport for streaming MCP events"""
+
+    def __init__(self, server_url: str, session_id: str):
+        """
+        Initialize SSE transport
+
+        Args:
+            server_url: HexStrike server URL
+            session_id: Session ID for this connection
+        """
+        self.server_url = server_url.rstrip("/")
+        self.session_id = session_id
+        self.sse_url = f"{self.server_url}/api/mcp/sse?session_id={session_id}"
+        self.running = False
+
+    def listen(self, callback):
+        """
+        Listen for SSE events and call callback for each event
+
+        Args:
+            callback: Function to call with each event data
+        """
+        self.running = True
+        logger.info(f"📡 Starting SSE listener for session {self.session_id}")
+
+        try:
+            response = requests.get(self.sse_url, stream=True, timeout=None)
+            response.raise_for_status()
+
+            for line in response.iter_lines():
+                if not self.running:
+                    break
+
+                if line:
+                    line = line.decode('utf-8')
+                    if line.startswith('data: '):
+                        data = line[6:]  # Remove 'data: ' prefix
+                        try:
+                            event_data = json.loads(data)
+                            callback(event_data)
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse SSE event: {e}")
+
+        except Exception as e:
+            logger.error(f"SSE connection error: {str(e)}")
+        finally:
+            self.running = False
+            logger.info("📡 SSE listener stopped")
+
+    def stop(self):
+        """Stop listening for events"""
+        self.running = False
+
 class HexStrikeClient:
     """Enhanced client for communicating with the HexStrike AI API Server"""
 
@@ -263,6 +318,18 @@ class HexStrikeClient:
             Health status information
         """
         return self.safe_get("health")
+
+    def create_session(self, api_key: str = "default") -> Dict[str, Any]:
+        """
+        Create a new MCP session for SSE/HTTP transport
+
+        Args:
+            api_key: API key for authentication
+
+        Returns:
+            Session creation response with session_id
+        """
+        return self.safe_post("api/mcp/session", {"api_key": api_key})
 
 def setup_mcp_server(hexstrike_client: HexStrikeClient) -> FastMCP:
     """
@@ -5420,6 +5487,12 @@ def parse_args():
                       help=f"HexStrike AI API server URL (default: {DEFAULT_HEXSTRIKE_SERVER})")
     parser.add_argument("--timeout", type=int, default=DEFAULT_REQUEST_TIMEOUT,
                       help=f"Request timeout in seconds (default: {DEFAULT_REQUEST_TIMEOUT})")
+    parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse", "streamable-http"],
+                      help="MCP transport protocol: stdio (default, stdin/stdout), sse (Server-Sent Events over HTTP), streamable-http (HTTP with streaming)")
+    parser.add_argument("--mcp-host", type=str, default="127.0.0.1",
+                      help="MCP server host address (default: 127.0.0.1, only used for sse/streamable-http transports)")
+    parser.add_argument("--mcp-port", type=int, default=8000,
+                      help="MCP server port (default: 8000, only used for sse/streamable-http transports)")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     return parser.parse_args()
 
@@ -5433,8 +5506,9 @@ def main():
         logger.debug("🔍 Debug logging enabled")
 
     # MCP compatibility: No banner output to avoid JSON parsing issues
-    logger.info(f"🚀 Starting HexStrike AI MCP Client v6.0")
-    logger.info(f"🔗 Connecting to: {args.server}")
+    logger.info(f"🚀 Starting HexStrike AI MCP Client v6.1")
+    logger.info(f"🔗 Connecting to HexStrike API: {args.server}")
+    logger.info(f"🚄 MCP Transport: {args.transport}")
 
     try:
         # Initialize the HexStrike AI client
@@ -5455,11 +5529,34 @@ def main():
                 if missing_tools:
                     logger.warning(f"❌ Missing tools: {', '.join(missing_tools[:5])}{'...' if len(missing_tools) > 5 else ''}")
 
-        # Set up and run the MCP server
+        # Handle SSE transport for internal hexstrike_mcp <-> hexstrike_server communication
+        if args.transport in ["sse", "streamable-http"]:
+            logger.info("📡 Initializing SSE session with HexStrike API server...")
+            session_response = hexstrike_client.create_session()
+            if session_response.get("success"):
+                session_id = session_response.get("session_id")
+                logger.info(f"✅ SSE session created: {session_id}")
+
+                # Create SSE transport for hexstrike_server communication
+                sse_transport = SSETransport(args.server, session_id)
+                logger.info("📡 SSE transport ready for HexStrike API server communication")
+            else:
+                logger.error(f"❌ Failed to create SSE session: {session_response.get('error')}")
+
+        # Set up the MCP server
         mcp = setup_mcp_server(hexstrike_client)
+
+        # Configure MCP server settings for SSE/HTTP transports
+        if args.transport in ["sse", "streamable-http"]:
+            mcp.settings.host = args.mcp_host
+            mcp.settings.port = args.mcp_port
+            logger.info(f"🌐 MCP server will listen on {args.mcp_host}:{args.mcp_port}")
+            logger.info(f"🔌 AI agents can connect via {args.transport} transport")
+
+        # Run the MCP server with the specified transport
         logger.info("🚀 Starting HexStrike AI MCP server")
         logger.info("🤖 Ready to serve AI agents with enhanced cybersecurity capabilities")
-        mcp.run()
+        mcp.run(transport=args.transport)
     except Exception as e:
         logger.error(f"💥 Error starting MCP server: {str(e)}")
         import traceback
